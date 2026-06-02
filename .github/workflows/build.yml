@@ -1,0 +1,209 @@
+name: Build Aseprite v1.2.23
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      skia_version:
+        description: 'Skia version tag (default: m81-b607b32047)'
+        required: false
+        default: 'm81-b607b32047'
+
+env:
+  SKIA_VERSION: "m81-b607b32047"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2019
+            platform: Windows
+            arch: x64
+            skia_os: Windows
+          - os: ubuntu-22.04
+            platform: Linux
+            arch: x64
+            skia_os: Linux
+          - os: macos-13
+            platform: macOS
+            arch: x64
+            skia_os: macOS
+
+    name: ${{ matrix.platform }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # ── Version Info ──────────────────────────────────────────
+      - name: Determine version info
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#v}"
+          else
+            TAG=""
+            VERSION="dev"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION (tag: $TAG)"
+
+      # ── Checkout ──────────────────────────────────────────────
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # ── Skia Version ──────────────────────────────────────────
+      - name: Determine Skia version
+        id: skia
+        shell: bash
+        run: |
+          VERSION="${{ github.event.inputs.skia_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ env.SKIA_VERSION }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using Skia version: $VERSION"
+
+      # ── Skia Cache ───────────────────────────────────────────
+      - name: Cache Skia
+        id: cache-skia
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/skia
+          key: skia-${{ steps.skia.outputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}
+
+      # ── Download Skia ─────────────────────────────────────────
+      - name: Download Skia
+        if: steps.cache-skia.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          SKIA_VERSION="${{ steps.skia.outputs.version }}"
+          SKIA_URL="https://github.com/aseprite/skia/releases/download/${SKIA_VERSION}/Skia-${{ matrix.skia_os }}-Release-${{ matrix.arch }}.zip"
+          echo "Downloading Skia from: $SKIA_URL"
+          curl -L -o "${{ runner.temp }}/skia.zip" "$SKIA_URL"
+          mkdir -p "${{ runner.temp }}/skia"
+          unzip "${{ runner.temp }}/skia.zip" -d "${{ runner.temp }}/skia"
+
+      # ── Install Ninja ─────────────────────────────────────────
+      - name: Install Ninja
+        uses: aseprite/get-ninja@main
+
+      # ── Linux Dependencies ────────────────────────────────────
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
+            libfontconfig1-dev
+
+      # ── Windows MSVC Dev Command ──────────────────────────────
+      - name: Setup MSVC Dev Command
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ── ccache ────────────────────────────────────────────────
+      - name: Setup ccache
+        if: runner.os != 'Windows'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.arch }}
+
+      # ── CMake Configure ───────────────────────────────────────
+      - name: Configure CMake
+        shell: bash
+        run: |
+          SKIA_DIR="${{ runner.temp }}/skia"
+          SKIA_LIB_DIR="${SKIA_DIR}/out/Release-${{ matrix.arch }}"
+
+          CMAKE_ARGS=(
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            -DLAF_BACKEND=skia
+            -DSKIA_DIR="$SKIA_DIR"
+            -DSKIA_LIBRARY_DIR="$SKIA_LIB_DIR"
+            -G Ninja
+          )
+
+          if [ "${{ runner.os }}" == "macOS" ]; then
+            CMAKE_ARGS+=(
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14
+              -DCMAKE_OSX_ARCHITECTURES=x86_64
+            )
+          fi
+
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            export CC=clang
+            export CXX=clang++
+            CMAKE_ARGS+=(
+              -DCMAKE_C_COMPILER=clang
+              -DCMAKE_CXX_COMPILER=clang++
+              -DCMAKE_CXX_FLAGS:STRING=-stdlib=libstdc++
+              -DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libstdc++
+            )
+          fi
+
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            CMAKE_ARGS+=(-DENABLE_CCACHE=on)
+          else
+            CMAKE_ARGS+=(-DENABLE_CCACHE=off)
+          fi
+
+          echo "CMake arguments: ${CMAKE_ARGS[@]}"
+          cmake -S . -B build "${CMAKE_ARGS[@]}"
+
+      # ── Build ─────────────────────────────────────────────────
+      - name: Build Aseprite
+        shell: bash
+        run: |
+          cd build
+          ninja aseprite
+
+      # ── Package Artifacts ─────────────────────────────────────
+      - name: Package artifacts
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARTIFACT_NAME="aseprite-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}"
+
+          mkdir -p "artifacts/${ARTIFACT_NAME}"
+          cp -r build/bin/* "artifacts/${ARTIFACT_NAME}/"
+
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            cd artifacts
+            7z a "${ARTIFACT_NAME}.zip" "${ARTIFACT_NAME}"
+          else
+            cd artifacts
+            tar -czvf "${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}"
+          fi
+
+      # ── Upload Artifacts ──────────────────────────────────────
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-${{ steps.version.outputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: build/bin/
+          retention-days: 30
+
+      # ── Create Release ────────────────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Aseprite ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
